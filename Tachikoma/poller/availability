@@ -1,0 +1,258 @@
+#!/usr/bin/python
+
+import sys, os
+import socket
+import signal
+import subprocess
+import tempfile
+import select
+import hashlib
+import pwd, grp
+import random
+
+TempRemoteBot = None
+OurTempBot = None
+TempLines = ""
+
+def SignalAlarm(signum, frame):
+	global TempName, TempRemoteBot, OurTempBot
+
+        print "Sig Alarm"
+	try:
+		os.unlink(TempRemoteBot[1])
+	except:
+		print "Error removing %s" % (TempRemoteBot[1])
+
+	try:
+		os.unlink(OurTempBot[1])
+	except:
+		print "Error removing %s" % (OurTempBot[1])
+
+        sys.exit(-2)
+
+def GetLines(s, GetAllLines = 0):
+        global AllMessages, TempLines, TempRemoteBot, OurTempBot
+
+        Lines = TempLines
+	TempLines = ""
+	NoData = 0
+	NewLine = ""
+
+        while(1):
+		(r,w,e) = select.select([s],[],[s],0.1)
+		if len(r) == 0:
+			if GetAllLines == 0:
+				print "empty return from socket"
+
+				try:
+					os.unlink(TempRemoteBot[1])
+				except:
+					print "Error removing %s" % (TempRemoteBot[1])
+
+				try:
+					os.unlink(OurTempBot[1])
+				except:
+					print "Error removing %s" % (OurTempBot[1])
+
+				sys.exit(-3)
+			else:
+				NoData = 1
+		else:
+                	NewLine = r[0].recv(4096)
+               		Lines += NewLine
+			if len(NewLine) == 0:
+				return (-1, Lines)
+
+		#if NoData then make sure GetAllLines is off so we return data
+		if NoData or (len(NewLine) == 0):
+			GetAllLines = 0
+
+		#return a line worth of info unless GetAllLines is set
+		if ((len(Lines) == 0) or (Lines[-1] == '\n')) and (GetAllLines == 0):
+			return (0, Lines)
+
+		if (Lines.find("\n") != -1) or NoData:
+			LineRet = Lines[0:Lines.rfind("\n") + 1]
+			TempLines = Lines[Lines.rfind("\n") + 1:]
+			return (0, LineRet)
+
+def main():
+	global TempRemoteBot, OurTempBot
+
+	#signal for more than 30 seconds
+        signal.signal(signal.SIGALRM, SignalAlarm)
+        signal.alarm(40)
+
+	#get a temp file
+	TempRemoteBot = tempfile.mkstemp()
+	os.close(TempRemoteBot[0])
+
+	#now download their robot
+	#subprocess.call(["scp","root@10.5.%s.4:/home/Tachikoma/server_robot.prg" % (sys.argv[1]) ,TempRemoteBot[1]])
+	subprocess.check_output(["scp","lightning@127.0.0.1:/home/lightning/personal-repo/robotbattle/server_robot.prg",TempRemoteBot[1]])
+
+	#read our bot in
+	FileList = os.listdir(".")
+	BotList = []
+	for i in FileList:
+		if i[0:12] == "service_bot_":
+			BotList.append(i)
+
+	#random the list and take the first
+	if random.randint(1, 5) == 1:
+		#1 in 5 chance of getting more than 1 bot
+		BotCount = random.randint(2, len(BotList))
+	else:
+		BotCount = 1
+
+	random.shuffle(BotList)
+
+	
+	BotData = ""
+	for i in xrange(0, BotCount):
+		print "Using %s" % (BotList[i])
+		CurBotData = open(BotList[i],"r").read()
+		BotData = BotData + str(len(CurBotData)) + "\n" + CurBotData
+	
+	#BotData = open("service_bot_1.prg","r").read()
+	#BotData = str(len(BotData)) + "\n" + BotData
+
+	print "Our bot count %d, len %d, hash %s" % (BotCount, len(BotData), hashlib.sha1(BotData).hexdigest())
+
+	BotData = str(BotCount) + "\n" + BotData
+
+	#get the hash of the remote bot
+	RemoteData = open(TempRemoteBot[1],"r").read()
+	print "Remote bot len %d, hash %s" % (len(RemoteData), hashlib.sha1(RemoteData).hexdigest())
+	#now connect
+	s = socket.create_connection((sys.argv[1], 9))
+	(Ret, RemoteData) = GetLines(s, 1)
+
+	#get the random seed
+	SeedData = RemoteData.split("\n")[0].split(" ")[1]
+
+	print "Team %s, Seed %s" % (sys.argv[1], SeedData)
+
+	#create the data to send to our validator
+	OurTempBot = tempfile.mkstemp()
+	os.write(OurTempBot[0], SeedData + "\n" + BotData)
+	os.close(OurTempBot[0])
+
+	#start our process in the background
+	#setup the temp file to be fd 1001
+	fd = os.open(TempRemoteBot[1], os.O_RDONLY)
+	os.dup2(fd, 1001)
+
+	#open our bot
+	botfd = os.open(OurTempBot[1], os.O_RDONLY)
+	OurPoller = subprocess.Popen(["./Tachikoma-Poller"], stdin=botfd, stdout=subprocess.PIPE)
+
+	#send our robot
+	s.send(BotData)
+
+	#now loop until a robot is declared a winner or too much time passes
+	FoundWinner = 0
+	while(not FoundWinner):
+		(RetVal, CurData) = GetLines(s, 1)
+		RemoteData += CurData
+
+		#split up the returned data and look for "RW x Robot yyyy wins"
+		CurData = CurData.split("\n")
+
+		#look at the last few lines
+		for i in xrange(3):
+			if len(CurData) == 0:
+				break
+
+			LastLine = CurData.pop()
+			if LastLine[0:3] == 'RW ':
+				#found a winning line, we are done
+				FoundWinner = 1
+				break
+
+		if RetVal == -1:
+			break
+
+	s.close()
+
+	#open("remotedata","w").write(RemoteData)
+
+	#wait for ours to finish then parse up the result
+	OurOutput = ""
+	while(OurPoller.poll() == None):
+		(outmsg, errmsg) = OurPoller.communicate()
+		OurOutput += outmsg
+
+	try:
+		OurOutput = OurOutput + OurPoller.stdout.read()
+	except:
+		pass
+
+	#open("localdata","w").write(OurOutput)
+	OurOutput = OurOutput.split("\n")
+
+	#remove the temp files
+	try:
+		os.unlink(TempRemoteBot[1])
+		TempRemoteBot = None
+	except:
+		print "Error removing %s" % (TempRemoteBot[1])
+
+	try:
+		os.unlink(OurTempBot[1])
+		OurTempBot = None
+	except:
+		print "Error removing %s" % (OurTempBot[1])
+
+	#remove all debug messages
+	CleanOutput = []
+	InternalAlarm = 0
+	for i in OurOutput:
+		if i[0:7] != 'debug: ':
+			CleanOutput.append(i)
+		if i == 'Alarm triggered':
+			InternalAlarm = 1
+
+	CleanRemoteData = []
+	RemoteData = RemoteData.split("\n")
+	for i in RemoteData:
+		if i[0:7] != 'debug: ':
+			CleanRemoteData.append(i)
+
+	#open("cleanoutput","w").write("\n".join(CleanOutput))
+	#open("cleanremote","w").write("\n".join(CleanRemoteData))
+
+	#now compare both, the final count may not be in sync due to the alarm
+	Matches = 0
+	for CurLine in CleanRemoteData:
+		OurOutput = CleanOutput.pop(0)
+		Matches = Matches + 1
+		if CurLine != OurOutput:
+			#if we alarmed local then allow a 90% match, otherwise fail
+			if InternalAlarm and (Matches > (len(CleanOutput) * 0.9)):
+				print "Both alarmed, assuming good"
+				return 0
+
+			print "Line mismatch, %s != %s" % (CurLine, OurOutput)
+			sys.exit(-1)
+
+	print "Good"
+	sys.exit(0)
+
+try:
+	main()
+except Exception as ex:
+	print "Error in python script"
+	print ex
+
+	if OurTempBot != None:
+		try:
+			os.unlink(OurTempBot[1])
+		except:
+			pass
+	if TempRemoteBot != None:
+		try:
+			os.unlink(TempRemoteBot[1])
+		except:
+			pass
+
